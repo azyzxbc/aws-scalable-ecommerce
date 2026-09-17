@@ -1,0 +1,261 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  CDN Stack — Amazon CloudFront distribution with two origins:
+  1. ALB origin for dynamic content (/api/*, /*)
+  2. S3 origin for static assets (/static/*, /images/*)
+  Includes S3 bucket for static assets with OAC (Origin Access Control),
+  TLS enforcement, and cache behaviors for optimal performance.
+  Project: Scalable E-Commerce Web Application on AWS
+  Author: Aziz Benchikh
+
+# =============================================================
+# PARAMETERS
+# =============================================================
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: EcommerceApp
+
+  PriceClass:
+    Type: String
+    Default: PriceClass_100
+    AllowedValues:
+      - PriceClass_100    # US, Canada, Europe (cheapest)
+      - PriceClass_200    # + Asia, Middle East, Africa
+      - PriceClass_All    # All edge locations (most expensive)
+    Description: CloudFront price class (controls which edge locations are used)
+
+# =============================================================
+# RESOURCES
+# =============================================================
+Resources:
+
+  # -----------------------------------------------------------
+  # S3 Bucket for Static Assets (product images, CSS, JS)
+  # -----------------------------------------------------------
+  StaticAssetsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub ${EnvironmentName}-static-assets-${AWS::AccountId}
+      # No public access — CloudFront uses OAC to access this bucket
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      # Encrypt bucket contents at rest
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      # Lifecycle: move old assets to cheaper storage
+      LifecycleConfiguration:
+        Rules:
+          - Id: MoveOldAssetsToIA
+            Status: Enabled
+            Transitions:
+              - TransitionInDays: 30
+                StorageClass: STANDARD_IA
+            NoncurrentVersionTransitions:
+              - TransitionInDays: 7
+                StorageClass: GLACIER
+      # Version control for safe deployments
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-Static-Assets
+        - Key: Project
+          Value: !Ref EnvironmentName
+
+  # -----------------------------------------------------------
+  # Origin Access Control (OAC) — modern replacement for OAI.
+  # Allows CloudFront to access the S3 bucket securely without
+  # making the bucket public.
+  # -----------------------------------------------------------
+  CloudFrontOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub ${EnvironmentName}-OAC
+        Description: !Sub OAC for ${EnvironmentName} S3 static assets bucket
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # S3 Bucket Policy — allow CloudFront OAC to read objects
+  StaticAssetsBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref StaticAssetsBucket
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: AllowCloudFrontOACRead
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub ${StaticAssetsBucket.Arn}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:aws:cloudfront::${AWS::AccountId}:distribution/${CloudFrontDistribution}
+
+  # -----------------------------------------------------------
+  # CloudFront Response Headers Policy — security headers
+  # -----------------------------------------------------------
+  SecurityHeadersPolicy:
+    Type: AWS::CloudFront::ResponseHeadersPolicy
+    Properties:
+      ResponseHeadersPolicyConfig:
+        Name: !Sub ${EnvironmentName}-Security-Headers
+        Comment: Security headers for e-commerce application
+        SecurityHeadersConfig:
+          StrictTransportSecurity:
+            Override: true
+            AccessControlMaxAgeSec: 31536000   # 1 year HSTS
+            IncludeSubdomains: true
+            Preload: true
+          ContentTypeOptions:
+            Override: true
+          FrameOptions:
+            FrameOption: DENY
+            Override: true
+          XSSProtection:
+            Override: true
+            Protection: true
+            ModeBlock: true
+          ReferrerPolicy:
+            Override: true
+            ReferrerPolicy: strict-origin-when-cross-origin
+
+  # -----------------------------------------------------------
+  # CloudFront Distribution
+  # -----------------------------------------------------------
+  CloudFrontDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub ${EnvironmentName} E-Commerce Distribution
+        Enabled: true
+        HttpVersion: http2and3
+        PriceClass: !Ref PriceClass
+        DefaultRootObject: index.html
+
+        # ---- Origins ----
+        Origins:
+          # Origin 1: ALB — dynamic application content
+          - Id: ALBOrigin
+            DomainName: !ImportValue
+              Fn::Sub: ${EnvironmentName}-ALB-DNS
+            CustomOriginConfig:
+              HTTPPort: 80
+              HTTPSPort: 443
+              OriginProtocolPolicy: http-only   # ALB → HTTP (TLS terminates at CF)
+              OriginSSLProtocols: [ TLSv1.2 ]
+              OriginReadTimeout: 30
+              OriginKeepaliveTimeout: 5
+            OriginCustomHeaders:
+              # Custom header so ALB knows traffic came through CloudFront
+              - HeaderName: X-CloudFront-Secret
+                HeaderValue: !Sub cf-secret-${AWS::StackName}
+
+          # Origin 2: S3 — static assets (images, CSS, JS)
+          - Id: S3StaticOrigin
+            DomainName: !GetAtt StaticAssetsBucket.RegionalDomainName
+            S3OriginConfig:
+              OriginAccessIdentity: ''   # Empty — using OAC instead of OAI
+            OriginAccessControlId: !GetAtt CloudFrontOAC.Id
+
+        # ---- Cache Behaviors ----
+        CacheBehaviors:
+          # Static assets — long cache TTL, serve from S3
+          - PathPattern: /static/*
+            TargetOriginId: S3StaticOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [ GET, HEAD ]
+            CachedMethods: [ GET, HEAD ]
+            Compress: true
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # CachingOptimized
+            ResponseHeadersPolicyId: !Ref SecurityHeadersPolicy
+
+          # Product images — long cache TTL, serve from S3
+          - PathPattern: /images/*
+            TargetOriginId: S3StaticOrigin
+            ViewerProtocolPolicy: redirect-to-https
+            AllowedMethods: [ GET, HEAD ]
+            CachedMethods: [ GET, HEAD ]
+            Compress: true
+            CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6  # CachingOptimized
+            ResponseHeadersPolicyId: !Ref SecurityHeadersPolicy
+
+        # Default behavior — dynamic content from ALB, no caching
+        DefaultCacheBehavior:
+          TargetOriginId: ALBOrigin
+          ViewerProtocolPolicy: redirect-to-https   # Always HTTPS
+          AllowedMethods: [ DELETE, GET, HEAD, OPTIONS, PATCH, POST, PUT ]
+          CachedMethods: [ GET, HEAD ]
+          Compress: true
+          # CachingDisabled policy for dynamic content
+          CachePolicyId: 4135ea2d-6df8-44a3-9df3-4b5a84be39ad
+          # Forward all headers to ALB for dynamic content
+          OriginRequestPolicyId: 216adef6-5c7f-47e4-b989-5492eafa07d3
+          ResponseHeadersPolicyId: !Ref SecurityHeadersPolicy
+
+        # ---- TLS / HTTPS ----
+        ViewerCertificate:
+          # Default CloudFront certificate (*.cloudfront.net)
+          # Replace with ACM certificate ARN for custom domain
+          CloudFrontDefaultCertificate: true
+          MinimumProtocolVersion: TLSv1.2_2021
+
+        # ---- Geo restriction (optional — disabled by default) ----
+        Restrictions:
+          GeoRestriction:
+            RestrictionType: none
+
+        # ---- Custom error pages ----
+        CustomErrorResponses:
+          - ErrorCode: 404
+            ResponseCode: 404
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 10
+          - ErrorCode: 503
+            ResponseCode: 503
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 0
+
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-CloudFront
+        - Key: Project
+          Value: !Ref EnvironmentName
+
+# =============================================================
+# OUTPUTS
+# =============================================================
+Outputs:
+
+  CloudFrontDomain:
+    Description: CloudFront distribution domain name (use this as your website URL)
+    Value: !GetAtt CloudFrontDistribution.DomainName
+    Export:
+      Name: !Sub ${EnvironmentName}-CF-Domain
+
+  CloudFrontDistributionId:
+    Description: CloudFront distribution ID
+    Value: !Ref CloudFrontDistribution
+    Export:
+      Name: !Sub ${EnvironmentName}-CF-Distribution-ID
+
+  StaticAssetsBucketName:
+    Description: S3 bucket name for static assets
+    Value: !Ref StaticAssetsBucket
+    Export:
+      Name: !Sub ${EnvironmentName}-Static-Bucket
+
+  StaticAssetsBucketArn:
+    Description: ARN of the S3 static assets bucket
+    Value: !GetAtt StaticAssetsBucket.Arn
+    Export:
+      Name: !Sub ${EnvironmentName}-Static-Bucket-ARN

@@ -1,0 +1,281 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Database Stack — RDS MySQL 8.0 Multi-AZ instance with automated failover,
+  DB Subnet Group spanning private DB subnets in both AZs, KMS encryption
+  at rest, automated backups, and AWS Secrets Manager for credential management.
+  Project: Scalable E-Commerce Web Application on AWS
+  Author: Aziz Benchikh
+
+# =============================================================
+# PARAMETERS
+# =============================================================
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: EcommerceApp
+
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    AllowedValues: [ db.t3.micro, db.t3.small, db.t3.medium ]
+    Description: RDS instance class
+
+  DBName:
+    Type: String
+    Default: ecommercedb
+    Description: Name of the initial MySQL database
+
+  DBAllocatedStorage:
+    Type: Number
+    Default: 20
+    Description: Initial allocated storage in GB (gp3)
+
+  DBBackupRetentionDays:
+    Type: Number
+    Default: 7
+    Description: Number of days to retain automated backups (1-35)
+
+  MultiAZEnabled:
+    Type: String
+    Default: 'true'
+    AllowedValues: [ 'true', 'false' ]
+    Description: Enable Multi-AZ deployment for automatic failover
+
+# =============================================================
+# RESOURCES
+# =============================================================
+Resources:
+
+  # -----------------------------------------------------------
+  # KMS Key for RDS encryption at rest
+  # Customer-managed key gives full control over key policy.
+  # -----------------------------------------------------------
+  RDSEncryptionKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: !Sub KMS key for ${EnvironmentName} RDS encryption at rest
+      EnableKeyRotation: true     # Rotate key annually (best practice)
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub arn:aws:iam::${AWS::AccountId}:root
+            Action: kms:*
+            Resource: '*'
+          - Sid: Allow RDS to use the key
+            Effect: Allow
+            Principal:
+              Service: rds.amazonaws.com
+            Action:
+              - kms:Decrypt
+              - kms:GenerateDataKey
+              - kms:DescribeKey
+            Resource: '*'
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-RDS-KMS-Key
+        - Key: Project
+          Value: !Ref EnvironmentName
+
+  RDSEncryptionKeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Sub alias/${EnvironmentName}-rds-key
+      TargetKeyId: !Ref RDSEncryptionKey
+
+  # -----------------------------------------------------------
+  # Secrets Manager Secret — Auto-generates a strong password
+  # for the RDS master user. EC2 instances retrieve this at
+  # runtime via the IAM role. No hardcoded credentials.
+  # -----------------------------------------------------------
+  DBSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${EnvironmentName}/rds/master-credentials
+      Description: !Sub RDS master credentials for ${EnvironmentName}
+      GenerateSecretString:
+        SecretStringTemplate: !Sub '{"username": "admin_${EnvironmentName}"}'
+        GenerateStringKey: password
+        PasswordLength: 32
+        ExcludeCharacters: '"@/\''
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-DB-Secret
+        - Key: Project
+          Value: !Ref EnvironmentName
+
+  # -----------------------------------------------------------
+  # RDS DB Subnet Group — must span at least 2 AZs for Multi-AZ
+  # -----------------------------------------------------------
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupName: !Sub ${EnvironmentName}-DB-Subnet-Group
+      DBSubnetGroupDescription: !Sub Subnet group for ${EnvironmentName} RDS (private DB subnets, 2 AZs)
+      SubnetIds:
+        - !ImportValue
+          Fn::Sub: ${EnvironmentName}-Private-DB-Subnet-AZ1
+        - !ImportValue
+          Fn::Sub: ${EnvironmentName}-Private-DB-Subnet-AZ2
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-DB-Subnet-Group
+
+  # -----------------------------------------------------------
+  # RDS Parameter Group — MySQL 8.0 tuning
+  # -----------------------------------------------------------
+  DBParameterGroup:
+    Type: AWS::RDS::DBParameterGroup
+    Properties:
+      Family: mysql8.0
+      Description: !Sub Custom parameter group for ${EnvironmentName} MySQL 8.0
+      Parameters:
+        # Enable slow query logging (helps with performance analysis)
+        slow_query_log: '1'
+        long_query_time: '2'
+        # Force SSL connections (encryption in transit)
+        require_secure_transport: 'ON'
+        # General settings
+        max_connections: '200'
+        innodb_buffer_pool_size: '{DBInstanceClassMemory*3/4}'
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-DB-Param-Group
+
+  # -----------------------------------------------------------
+  # RDS MySQL 8.0 Multi-AZ Instance
+  # -----------------------------------------------------------
+  DBInstance:
+    Type: AWS::RDS::DBInstance
+    DependsOn: DBSubnetGroup
+    DeletionPolicy: Snapshot   # Create final snapshot on stack deletion
+    UpdateReplacePolicy: Snapshot
+    Properties:
+      DBInstanceIdentifier: !Sub ${EnvironmentName}-mysql-db
+      DBName: !Ref DBName
+      DBInstanceClass: !Ref DBInstanceClass
+      Engine: mysql
+      EngineVersion: '8.0'
+      MasterUsername: !Sub '{{resolve:secretsmanager:${DBSecret}:SecretString:username}}'
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${DBSecret}:SecretString:password}}'
+
+      # Storage configuration
+      AllocatedStorage: !Ref DBAllocatedStorage
+      StorageType: gp3
+      MaxAllocatedStorage: 100   # Storage auto-scaling up to 100 GB
+      StorageEncrypted: true
+      KmsKeyId: !Ref RDSEncryptionKey
+
+      # High Availability
+      MultiAZ: !Ref MultiAZEnabled
+      AvailabilityZone: !If
+        - IsMultiAZ
+        - !Ref AWS::NoValue  # Multi-AZ auto-selects AZ
+        - !Select [ 0, !GetAZs '' ]
+
+      # Network
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VPCSecurityGroups:
+        - !ImportValue
+          Fn::Sub: ${EnvironmentName}-RDS-SG
+      PubliclyAccessible: false   # Always private — never exposed to internet
+
+      # Parameter and option groups
+      DBParameterGroupName: !Ref DBParameterGroup
+
+      # Backup & maintenance
+      BackupRetentionPeriod: !Ref DBBackupRetentionDays
+      PreferredBackupWindow: 03:00-04:00      # 3-4 AM UTC (low traffic)
+      PreferredMaintenanceWindow: sun:04:00-sun:05:00
+
+      # Monitoring
+      EnableCloudwatchLogsExports:
+        - error
+        - slowquery
+        - general
+      MonitoringInterval: 60           # Enhanced monitoring every 60s
+      MonitoringRoleArn: !GetAtt RDSMonitoringRole.Arn
+      EnablePerformanceInsights: true  # Performance Insights (free tier: 7 days)
+      PerformanceInsightsRetentionPeriod: 7
+
+      # Protection
+      DeletionProtection: false        # Set to true in production
+      AutoMinorVersionUpgrade: true
+      CopyTagsToSnapshot: true
+
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-MySQL-DB
+        - Key: Project
+          Value: !Ref EnvironmentName
+
+  # -----------------------------------------------------------
+  # IAM Role for RDS Enhanced Monitoring
+  # -----------------------------------------------------------
+  RDSMonitoringRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-RDS-Monitoring-Role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: monitoring.rds.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole
+
+  # -----------------------------------------------------------
+  # SecretManager Attachment — links secret to RDS instance
+  # Enables automatic rotation (optional, can be activated later)
+  # -----------------------------------------------------------
+  DBSecretAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref DBSecret
+      TargetId: !Ref DBInstance
+      TargetType: AWS::RDS::DBInstance
+
+# =============================================================
+# CONDITIONS
+# =============================================================
+Conditions:
+  IsMultiAZ: !Equals [ !Ref MultiAZEnabled, 'true' ]
+
+# =============================================================
+# OUTPUTS
+# =============================================================
+Outputs:
+
+  DBEndpoint:
+    Description: RDS instance endpoint address
+    Value: !GetAtt DBInstance.Endpoint.Address
+    Export:
+      Name: !Sub ${EnvironmentName}-DB-Endpoint
+
+  DBPort:
+    Description: RDS instance port
+    Value: !GetAtt DBInstance.Endpoint.Port
+    Export:
+      Name: !Sub ${EnvironmentName}-DB-Port
+
+  DBName:
+    Description: Database name
+    Value: !Ref DBName
+    Export:
+      Name: !Sub ${EnvironmentName}-DB-Name
+
+  DBSecretArn:
+    Description: ARN of the Secrets Manager secret for DB credentials
+    Value: !Ref DBSecret
+    Export:
+      Name: !Sub ${EnvironmentName}-DB-Secret-ARN
+
+  DBInstanceId:
+    Description: RDS instance identifier
+    Value: !Ref DBInstance
+    Export:
+      Name: !Sub ${EnvironmentName}-DB-Instance-ID

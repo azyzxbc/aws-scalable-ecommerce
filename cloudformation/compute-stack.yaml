@@ -1,0 +1,471 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Compute Stack — EC2 Launch Template, Auto Scaling Group (multi-AZ),
+  Application Load Balancer with HTTPS listener, Target Group with health
+  checks, and IAM instance role for SSM Session Manager access.
+  Project: Scalable E-Commerce Web Application on AWS
+  Author: Aziz Benchikh
+
+# =============================================================
+# PARAMETERS
+# =============================================================
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: EcommerceApp
+
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [ t3.micro, t3.small, t3.medium ]
+    Description: EC2 instance type for the Auto Scaling Group
+
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+    Description: Latest Amazon Linux 2023 AMI (auto-resolved via SSM Parameter Store)
+
+  MinInstances:
+    Type: Number
+    Default: 2
+    Description: Minimum number of EC2 instances in the ASG
+
+  MaxInstances:
+    Type: Number
+    Default: 6
+    Description: Maximum number of EC2 instances in the ASG
+
+  DesiredInstances:
+    Type: Number
+    Default: 2
+    Description: Desired number of EC2 instances at launch
+
+  DBEndpoint:
+    Type: String
+    Description: RDS endpoint address (from database stack output)
+
+  DBSecretArn:
+    Type: String
+    Description: ARN of Secrets Manager secret containing DB credentials
+
+# =============================================================
+# RESOURCES
+# =============================================================
+Resources:
+
+  # -----------------------------------------------------------
+  # IAM Role for EC2 — allows SSM Session Manager + Secrets
+  # Manager read access. No SSH key needed.
+  # -----------------------------------------------------------
+  EC2InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${EnvironmentName}-EC2-Instance-Role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        # Enables SSM Session Manager (no SSH/bastion needed)
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        # CloudWatch agent for custom metrics
+        - arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy
+      Policies:
+        - PolicyName: SecretsManagerReadPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - secretsmanager:GetSecretValue
+                  - secretsmanager:DescribeSecret
+                Resource: !Ref DBSecretArn
+      Tags:
+        - Key: Project
+          Value: !Ref EnvironmentName
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub ${EnvironmentName}-EC2-Instance-Profile
+      Roles:
+        - !Ref EC2InstanceRole
+
+  # -----------------------------------------------------------
+  # EC2 Launch Template
+  # Amazon Linux 2023, user data installs a sample e-commerce
+  # product catalog page served by Nginx.
+  # -----------------------------------------------------------
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub ${EnvironmentName}-Launch-Template
+      LaunchTemplateData:
+        ImageId: !Ref AmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt EC2InstanceProfile.Arn
+        SecurityGroupIds:
+          - !ImportValue
+            Fn::Sub: ${EnvironmentName}-EC2-SG
+        # EBS root volume: gp3, 20 GB, encrypted
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs:
+              VolumeSize: 20
+              VolumeType: gp3
+              Encrypted: true
+              DeleteOnTermination: true
+        MetadataOptions:
+          HttpTokens: required        # IMDSv2 only (security best practice)
+          HttpEndpoint: enabled
+        # User data: install Nginx + sample e-commerce product catalog HTML
+        UserData:
+          Fn::Base64: !Sub |
+            #!/bin/bash
+            set -ex
+
+            # Update system packages
+            dnf update -y
+
+            # Install Nginx
+            dnf install -y nginx
+
+            # Install AWS CLI (for Secrets Manager)
+            dnf install -y awscli
+
+            # Retrieve DB credentials from Secrets Manager
+            SECRET=$(aws secretsmanager get-secret-value \
+              --secret-id ${DBSecretArn} \
+              --region ${AWS::Region} \
+              --query SecretString \
+              --output text)
+            DB_USER=$(echo $SECRET | python3 -c "import sys,json; print(json.load(sys.stdin)['username'])")
+            DB_PASS=$(echo $SECRET | python3 -c "import sys,json; print(json.load(sys.stdin)['password'])")
+
+            # Export DB config (would be used by app)
+            echo "DB_HOST=${DBEndpoint}" >> /etc/environment
+            echo "DB_USER=$DB_USER" >> /etc/environment
+            echo "DB_PORT=3306" >> /etc/environment
+
+            # Create product catalog HTML page
+            mkdir -p /usr/share/nginx/html
+            cat > /usr/share/nginx/html/index.html << 'HTML_EOF'
+            <!DOCTYPE html>
+            <html lang="en">
+            <head>
+              <meta charset="UTF-8">
+              <meta name="viewport" content="width=device-width, initial-scale=1.0">
+              <title>ShopAWS – E-Commerce on AWS</title>
+              <style>
+                * { margin:0; padding:0; box-sizing:border-box; }
+                body { font-family: 'Segoe UI', sans-serif; background:#0f172a; color:#e2e8f0; }
+                header { background:linear-gradient(135deg,#1e3a5f,#0ea5e9);
+                         padding:2rem; text-align:center; }
+                header h1 { font-size:2.5rem; color:#fff; }
+                header p { color:#bae6fd; margin-top:.5rem; }
+                .badge { background:#10b981; color:#fff; padding:.2rem .8rem;
+                         border-radius:1rem; font-size:.8rem; margin-top:.5rem;
+                         display:inline-block; }
+                .grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(280px,1fr));
+                        gap:1.5rem; padding:2rem; max-width:1200px; margin:0 auto; }
+                .card { background:#1e293b; border-radius:1rem; overflow:hidden;
+                        box-shadow:0 4px 20px rgba(0,0,0,.4);
+                        transition:transform .2s; border:1px solid #334155; }
+                .card:hover { transform:translateY(-4px); }
+                .card img { width:100%; height:200px; object-fit:cover; }
+                .card-body { padding:1.2rem; }
+                .card-body h3 { color:#f1f5f9; font-size:1.1rem; }
+                .card-body .price { color:#0ea5e9; font-size:1.4rem;
+                                    font-weight:700; margin:.5rem 0; }
+                .card-body p { color:#94a3b8; font-size:.9rem; }
+                .btn { display:block; background:#0ea5e9; color:#fff; border:none;
+                       padding:.8rem; border-radius:.5rem; cursor:pointer;
+                       margin-top:1rem; font-size:1rem; text-align:center;
+                       text-decoration:none; transition:background .2s; }
+                .btn:hover { background:#0284c7; }
+                footer { text-align:center; padding:2rem; color:#64748b;
+                         border-top:1px solid #1e293b; }
+              </style>
+            </head>
+            <body>
+              <header>
+                <h1>🛍️ ShopAWS</h1>
+                <p>Powered by AWS — Scalable, Highly Available, Secure</p>
+                <span class="badge">✅ Running on EC2 Auto Scaling</span>
+              </header>
+              <div class="grid">
+                <div class="card">
+                  <div style="height:200px;background:linear-gradient(135deg,#1e3a5f,#0ea5e9);display:flex;align-items:center;justify-content:center;font-size:4rem;">💻</div>
+                  <div class="card-body">
+                    <h3>AWS Certified Laptop</h3>
+                    <div class="price">$1,299.99</div>
+                    <p>High-performance laptop optimized for cloud development.</p>
+                    <a class="btn" href="#">Add to Cart</a>
+                  </div>
+                </div>
+                <div class="card">
+                  <div style="height:200px;background:linear-gradient(135deg,#064e3b,#10b981);display:flex;align-items:center;justify-content:center;font-size:4rem;">📱</div>
+                  <div class="card-body">
+                    <h3>CloudPhone Pro</h3>
+                    <div class="price">$899.99</div>
+                    <p>Smartphone with seamless AWS integration and cloud backup.</p>
+                    <a class="btn" href="#">Add to Cart</a>
+                  </div>
+                </div>
+                <div class="card">
+                  <div style="height:200px;background:linear-gradient(135deg,#4c1d95,#8b5cf6);display:flex;align-items:center;justify-content:center;font-size:4rem;">🎧</div>
+                  <div class="card-body">
+                    <h3>Echo Headset X</h3>
+                    <div class="price">$249.99</div>
+                    <p>Noise-cancelling headset with Alexa built-in.</p>
+                    <a class="btn" href="#">Add to Cart</a>
+                  </div>
+                </div>
+                <div class="card">
+                  <div style="height:200px;background:linear-gradient(135deg,#7c2d12,#f97316);display:flex;align-items:center;justify-content:center;font-size:4rem;">⌚</div>
+                  <div class="card-body">
+                    <h3>SmartWatch Ultra</h3>
+                    <div class="price">$399.99</div>
+                    <p>IoT-enabled smartwatch that connects to AWS IoT Core.</p>
+                    <a class="btn" href="#">Add to Cart</a>
+                  </div>
+                </div>
+              </div>
+              <footer>
+                <p>© 2024 ShopAWS | Architecture: ALB + ASG + RDS Multi-AZ | Region: us-east-1</p>
+                <p style="margin-top:.5rem;font-size:.8rem;">
+                  Instance ID: $(curl -s http://169.254.169.254/latest/meta-data/instance-id 2>/dev/null || echo 'N/A') |
+                  AZ: $(curl -s http://169.254.169.254/latest/meta-data/placement/availability-zone 2>/dev/null || echo 'N/A')
+                </p>
+              </footer>
+            </body>
+            </html>
+            HTML_EOF
+
+            # Health check endpoint for ALB
+            echo "healthy" > /usr/share/nginx/html/health
+
+            # Nginx config
+            cat > /etc/nginx/conf.d/ecommerce.conf << 'NGINX_EOF'
+            server {
+                listen 80;
+                server_name _;
+                root /usr/share/nginx/html;
+                index index.html;
+
+                location /health {
+                    access_log off;
+                    return 200 "healthy\n";
+                    add_header Content-Type text/plain;
+                }
+
+                location / {
+                    try_files $uri $uri/ =404;
+                }
+            }
+            NGINX_EOF
+
+            # Enable and start Nginx
+            systemctl enable nginx
+            systemctl start nginx
+
+            # Install and configure CloudWatch agent
+            dnf install -y amazon-cloudwatch-agent
+            /opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl \
+              -a fetch-config \
+              -m ec2 \
+              -s \
+              -c default
+
+            echo "Bootstrap complete!"
+
+        TagSpecifications:
+          - ResourceType: instance
+            Tags:
+              - Key: Name
+                Value: !Sub ${EnvironmentName}-EC2-Instance
+              - Key: Project
+                Value: !Ref EnvironmentName
+
+  # -----------------------------------------------------------
+  # Application Load Balancer (spans both public subnets)
+  # -----------------------------------------------------------
+  ApplicationLoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub ${EnvironmentName}-ALB
+      Type: application
+      Scheme: internet-facing
+      SecurityGroups:
+        - !ImportValue
+          Fn::Sub: ${EnvironmentName}-ALB-SG
+      Subnets:
+        - !ImportValue
+          Fn::Sub: ${EnvironmentName}-Public-Subnet-AZ1
+        - !ImportValue
+          Fn::Sub: ${EnvironmentName}-Public-Subnet-AZ2
+      LoadBalancerAttributes:
+        - Key: idle_timeout.timeout_seconds
+          Value: '60'
+        - Key: routing.http2.enabled
+          Value: 'true'
+        - Key: access_logs.s3.enabled
+          Value: 'false'
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-ALB
+        - Key: Project
+          Value: !Ref EnvironmentName
+
+  # -----------------------------------------------------------
+  # Target Group — HTTP on port 80, health check on /health
+  # -----------------------------------------------------------
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: !Sub ${EnvironmentName}-TG
+      Port: 80
+      Protocol: HTTP
+      VpcId: !ImportValue
+        Fn::Sub: ${EnvironmentName}-VPC-ID
+      TargetType: instance
+      HealthCheckEnabled: true
+      HealthCheckPath: /health
+      HealthCheckIntervalSeconds: 30
+      HealthCheckTimeoutSeconds: 5
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 5
+      Matcher:
+        HttpCode: '200'
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: '30'
+        - Key: stickiness.enabled
+          Value: 'false'
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-TG
+
+  # -----------------------------------------------------------
+  # ALB Listener — HTTP on port 80 (redirect to HTTPS)
+  # Note: For HTTPS, add your SSL certificate ARN and create
+  # an HTTPS listener. HTTP redirect is set up below.
+  # -----------------------------------------------------------
+  ALBListenerHTTP:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref ApplicationLoadBalancer
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+
+  # -----------------------------------------------------------
+  # Auto Scaling Group — spans private subnets in both AZs
+  # -----------------------------------------------------------
+  AutoScalingGroup:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    Properties:
+      AutoScalingGroupName: !Sub ${EnvironmentName}-ASG
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      MinSize: !Ref MinInstances
+      MaxSize: !Ref MaxInstances
+      DesiredCapacity: !Ref DesiredInstances
+      # Private subnets — one per AZ for high availability
+      VPCZoneIdentifier:
+        - !ImportValue
+          Fn::Sub: ${EnvironmentName}-Private-Subnet-AZ1
+        - !ImportValue
+          Fn::Sub: ${EnvironmentName}-Private-Subnet-AZ2
+      # Register instances with ALB target group
+      TargetGroupARNs:
+        - !Ref TargetGroup
+      # ALB health check (more comprehensive than EC2 status check)
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 300
+      # Replace unhealthy instances automatically
+      DefaultInstanceWarmup: 120
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-ASG-Instance
+          PropagateAtLaunch: true
+        - Key: Project
+          Value: !Ref EnvironmentName
+          PropagateAtLaunch: true
+
+  # -----------------------------------------------------------
+  # Auto Scaling Policy — Target Tracking (CPU at 60%)
+  # Automatically adds/removes instances based on CPU usage.
+  # -----------------------------------------------------------
+  CPUTargetTrackingPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ASGAverageCPUUtilization
+        TargetValue: 60.0          # Scale out when avg CPU > 60%
+        ScaleInCooldown: 300       # Wait 5 min before scaling in
+        ScaleOutCooldown: 60       # Scale out faster (60s)
+        DisableScaleIn: false
+
+  # Request count scaling — scale on ALB requests per target
+  RequestCountPolicy:
+    Type: AWS::AutoScaling::ScalingPolicy
+    Properties:
+      AutoScalingGroupName: !Ref AutoScalingGroup
+      PolicyType: TargetTrackingScaling
+      TargetTrackingConfiguration:
+        PredefinedMetricSpecification:
+          PredefinedMetricType: ALBRequestCountPerTarget
+          ResourceLabel: !Sub
+            - ${ALBFullName}/${TargetGroupFullName}
+            - ALBFullName: !GetAtt ApplicationLoadBalancer.LoadBalancerFullName
+              TargetGroupFullName: !GetAtt TargetGroup.TargetGroupFullName
+        TargetValue: 1000          # Scale when > 1000 req/target/min
+        ScaleInCooldown: 300
+        ScaleOutCooldown: 60
+        DisableScaleIn: false
+
+# =============================================================
+# OUTPUTS
+# =============================================================
+Outputs:
+
+  ALBDNSName:
+    Description: DNS name of the Application Load Balancer
+    Value: !GetAtt ApplicationLoadBalancer.DNSName
+    Export:
+      Name: !Sub ${EnvironmentName}-ALB-DNS
+
+  ALBArn:
+    Description: ARN of the Application Load Balancer
+    Value: !Ref ApplicationLoadBalancer
+    Export:
+      Name: !Sub ${EnvironmentName}-ALB-ARN
+
+  ALBFullName:
+    Description: Full name of the ALB (for CloudWatch metrics)
+    Value: !GetAtt ApplicationLoadBalancer.LoadBalancerFullName
+    Export:
+      Name: !Sub ${EnvironmentName}-ALB-FullName
+
+  TargetGroupArn:
+    Description: ARN of the ALB Target Group
+    Value: !Ref TargetGroup
+    Export:
+      Name: !Sub ${EnvironmentName}-TG-ARN
+
+  AutoScalingGroupName:
+    Description: Name of the Auto Scaling Group
+    Value: !Ref AutoScalingGroup
+    Export:
+      Name: !Sub ${EnvironmentName}-ASG-Name

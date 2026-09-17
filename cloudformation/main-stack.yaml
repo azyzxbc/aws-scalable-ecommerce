@@ -1,0 +1,295 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Main (Root) Stack — Orchestrates all nested stacks in the correct dependency
+  order. Deploy this single template to provision the complete e-commerce
+  architecture: Network → Security → Database → Compute → CDN → Monitoring.
+  Project: Scalable E-Commerce Web Application on AWS
+  Author: Aziz Benchikh
+
+# =============================================================
+# METADATA — Console parameter grouping
+# =============================================================
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: General Configuration
+        Parameters: [ EnvironmentName, TemplatesBucketName ]
+      - Label:
+          default: Network Configuration
+        Parameters: [ VpcCIDR, PublicSubnet1CIDR, PublicSubnet2CIDR,
+                      PrivateSubnet1CIDR, PrivateSubnet2CIDR,
+                      PrivateDBSubnet1CIDR, PrivateDBSubnet2CIDR ]
+      - Label:
+          default: Compute Configuration
+        Parameters: [ InstanceType, MinInstances, MaxInstances, DesiredInstances ]
+      - Label:
+          default: Database Configuration
+        Parameters: [ DBInstanceClass, DBName, DBBackupRetentionDays, MultiAZEnabled ]
+      - Label:
+          default: CDN Configuration
+        Parameters: [ PriceClass ]
+      - Label:
+          default: Monitoring & Alerts
+        Parameters: [ AlertEmail ]
+    ParameterLabels:
+      EnvironmentName:
+        default: Environment Name (used as prefix for all resources)
+      TemplatesBucketName:
+        default: S3 Bucket containing nested stack templates
+      AlertEmail:
+        default: Email address for CloudWatch alarm notifications
+
+# =============================================================
+# PARAMETERS
+# =============================================================
+Parameters:
+
+  EnvironmentName:
+    Type: String
+    Default: EcommerceApp
+    Description: >
+      Prefix for all resource names and CloudFormation export names.
+      Use a short, alphanumeric name (e.g., EcommerceApp, MyShop).
+
+  TemplatesBucketName:
+    Type: String
+    Description: >
+      Name of the S3 bucket where nested stack templates are uploaded.
+      Upload all cloudformation/*.yaml files to this bucket before deploying.
+    AllowedPattern: '[a-z0-9][a-z0-9\-]*'
+
+  # --- Network Parameters ---
+  VpcCIDR:
+    Type: String
+    Default: 10.0.0.0/16
+  PublicSubnet1CIDR:
+    Type: String
+    Default: 10.0.1.0/24
+  PublicSubnet2CIDR:
+    Type: String
+    Default: 10.0.2.0/24
+  PrivateSubnet1CIDR:
+    Type: String
+    Default: 10.0.10.0/24
+  PrivateSubnet2CIDR:
+    Type: String
+    Default: 10.0.20.0/24
+  PrivateDBSubnet1CIDR:
+    Type: String
+    Default: 10.0.30.0/24
+  PrivateDBSubnet2CIDR:
+    Type: String
+    Default: 10.0.40.0/24
+
+  # --- Compute Parameters ---
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [ t3.micro, t3.small, t3.medium ]
+  MinInstances:
+    Type: Number
+    Default: 2
+  MaxInstances:
+    Type: Number
+    Default: 6
+  DesiredInstances:
+    Type: Number
+    Default: 2
+
+  # --- Database Parameters ---
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    AllowedValues: [ db.t3.micro, db.t3.small, db.t3.medium ]
+  DBName:
+    Type: String
+    Default: ecommercedb
+  DBBackupRetentionDays:
+    Type: Number
+    Default: 7
+  MultiAZEnabled:
+    Type: String
+    Default: 'true'
+    AllowedValues: [ 'true', 'false' ]
+
+  # --- CDN Parameters ---
+  PriceClass:
+    Type: String
+    Default: PriceClass_100
+    AllowedValues: [ PriceClass_100, PriceClass_200, PriceClass_All ]
+
+  # --- Monitoring Parameters ---
+  AlertEmail:
+    Type: String
+    Description: Email address to receive alarm notifications
+
+# =============================================================
+# RESOURCES — Nested Stacks (deployed in dependency order)
+# =============================================================
+Resources:
+
+  # -----------------------------------------------------------
+  # 1. Network Stack (no dependencies)
+  # -----------------------------------------------------------
+  NetworkStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: !Sub https://${TemplatesBucketName}.s3.${AWS::Region}.amazonaws.com/network-stack.yaml
+      Parameters:
+        EnvironmentName: !Ref EnvironmentName
+        VpcCIDR: !Ref VpcCIDR
+        PublicSubnet1CIDR: !Ref PublicSubnet1CIDR
+        PublicSubnet2CIDR: !Ref PublicSubnet2CIDR
+        PrivateSubnet1CIDR: !Ref PrivateSubnet1CIDR
+        PrivateSubnet2CIDR: !Ref PrivateSubnet2CIDR
+        PrivateDBSubnet1CIDR: !Ref PrivateDBSubnet1CIDR
+        PrivateDBSubnet2CIDR: !Ref PrivateDBSubnet2CIDR
+      TimeoutInMinutes: 15
+      Tags:
+        - Key: Project
+          Value: !Ref EnvironmentName
+        - Key: Layer
+          Value: Network
+
+  # -----------------------------------------------------------
+  # 2. Security Stack (depends on: Network)
+  # -----------------------------------------------------------
+  SecurityStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: NetworkStack
+    Properties:
+      TemplateURL: !Sub https://${TemplatesBucketName}.s3.${AWS::Region}.amazonaws.com/security-stack.yaml
+      Parameters:
+        EnvironmentName: !Ref EnvironmentName
+      TimeoutInMinutes: 10
+      Tags:
+        - Key: Project
+          Value: !Ref EnvironmentName
+        - Key: Layer
+          Value: Security
+
+  # -----------------------------------------------------------
+  # 3. Database Stack (depends on: Network, Security)
+  # -----------------------------------------------------------
+  DatabaseStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn:
+      - NetworkStack
+      - SecurityStack
+    Properties:
+      TemplateURL: !Sub https://${TemplatesBucketName}.s3.${AWS::Region}.amazonaws.com/database-stack.yaml
+      Parameters:
+        EnvironmentName: !Ref EnvironmentName
+        DBInstanceClass: !Ref DBInstanceClass
+        DBName: !Ref DBName
+        DBBackupRetentionDays: !Ref DBBackupRetentionDays
+        MultiAZEnabled: !Ref MultiAZEnabled
+      TimeoutInMinutes: 30    # RDS Multi-AZ takes ~15-20 minutes
+      Tags:
+        - Key: Project
+          Value: !Ref EnvironmentName
+        - Key: Layer
+          Value: Database
+
+  # -----------------------------------------------------------
+  # 4. Compute Stack (depends on: Network, Security, Database)
+  # The DB endpoint and secret ARN are passed from the DB stack.
+  # -----------------------------------------------------------
+  ComputeStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn:
+      - NetworkStack
+      - SecurityStack
+      - DatabaseStack
+    Properties:
+      TemplateURL: !Sub https://${TemplatesBucketName}.s3.${AWS::Region}.amazonaws.com/compute-stack.yaml
+      Parameters:
+        EnvironmentName: !Ref EnvironmentName
+        InstanceType: !Ref InstanceType
+        MinInstances: !Ref MinInstances
+        MaxInstances: !Ref MaxInstances
+        DesiredInstances: !Ref DesiredInstances
+        DBEndpoint: !GetAtt DatabaseStack.Outputs.DBEndpoint
+        DBSecretArn: !GetAtt DatabaseStack.Outputs.DBSecretArn
+      TimeoutInMinutes: 20
+      Tags:
+        - Key: Project
+          Value: !Ref EnvironmentName
+        - Key: Layer
+          Value: Compute
+
+  # -----------------------------------------------------------
+  # 5. CDN Stack (depends on: Compute)
+  # CloudFront uses ALB DNS from the compute stack.
+  # -----------------------------------------------------------
+  CDNStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: ComputeStack
+    Properties:
+      TemplateURL: !Sub https://${TemplatesBucketName}.s3.${AWS::Region}.amazonaws.com/cdn-stack.yaml
+      Parameters:
+        EnvironmentName: !Ref EnvironmentName
+        PriceClass: !Ref PriceClass
+      TimeoutInMinutes: 20    # CloudFront deployment takes ~10-15 minutes
+      Tags:
+        - Key: Project
+          Value: !Ref EnvironmentName
+        - Key: Layer
+          Value: CDN
+
+  # -----------------------------------------------------------
+  # 6. Monitoring Stack (depends on: Compute, Database)
+  # References ASG name, ALB full name, and TG ARN from compute.
+  # -----------------------------------------------------------
+  MonitoringStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn:
+      - ComputeStack
+      - DatabaseStack
+    Properties:
+      TemplateURL: !Sub https://${TemplatesBucketName}.s3.${AWS::Region}.amazonaws.com/monitoring-stack.yaml
+      Parameters:
+        EnvironmentName: !Ref EnvironmentName
+        AlertEmail: !Ref AlertEmail
+      TimeoutInMinutes: 10
+      Tags:
+        - Key: Project
+          Value: !Ref EnvironmentName
+        - Key: Layer
+          Value: Monitoring
+
+# =============================================================
+# OUTPUTS — consolidated outputs from all stacks
+# =============================================================
+Outputs:
+
+  WebsiteURL:
+    Description: >
+      CloudFront URL for the e-commerce website. Use this in your browser
+      (or point your custom domain here via Route 53).
+    Value: !Sub https://${CDNStack.Outputs.CloudFrontDomain}
+
+  ALBDirectURL:
+    Description: Direct ALB URL (internal testing only — use CloudFront URL in production)
+    Value: !Sub http://${ComputeStack.Outputs.ALBDNSName}
+
+  DBEndpoint:
+    Description: RDS MySQL endpoint
+    Value: !GetAtt DatabaseStack.Outputs.DBEndpoint
+
+  DBSecretARN:
+    Description: Secrets Manager ARN for RDS credentials
+    Value: !GetAtt DatabaseStack.Outputs.DBSecretArn
+
+  CloudFrontDistributionId:
+    Description: CloudFront Distribution ID (needed for cache invalidation)
+    Value: !GetAtt CDNStack.Outputs.CloudFrontDistributionId
+
+  StaticAssetsBucket:
+    Description: S3 bucket for static assets (upload images, CSS, JS here)
+    Value: !GetAtt CDNStack.Outputs.StaticAssetsBucketName
+
+  CloudWatchDashboard:
+    Description: CloudWatch monitoring dashboard URL
+    Value: !GetAtt MonitoringStack.Outputs.DashboardURL

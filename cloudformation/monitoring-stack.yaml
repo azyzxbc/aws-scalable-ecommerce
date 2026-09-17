@@ -1,0 +1,363 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Monitoring Stack — CloudWatch dashboards, alarms for key metrics (CPU,
+  unhealthy hosts, RDS connections, latency), SNS topic for notifications,
+  and ALB access log delivery. Covers both the compute and database tiers.
+  Project: Scalable E-Commerce Web Application on AWS
+  Author: Aziz Benchikh
+
+# =============================================================
+# PARAMETERS
+# =============================================================
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: EcommerceApp
+
+  AlertEmail:
+    Type: String
+    Description: Email address to receive CloudWatch alarm notifications
+    AllowedPattern: '[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}'
+
+  CPUAlarmThreshold:
+    Type: Number
+    Default: 80
+    Description: CPU utilization % that triggers a HIGH alarm (separate from ASG target tracking)
+
+  UnhealthyHostThreshold:
+    Type: Number
+    Default: 1
+    Description: Number of unhealthy ALB targets that triggers an alarm
+
+# =============================================================
+# RESOURCES
+# =============================================================
+Resources:
+
+  # -----------------------------------------------------------
+  # SNS Topic — receives all CloudWatch alarm notifications
+  # -----------------------------------------------------------
+  AlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${EnvironmentName}-Alerts
+      DisplayName: !Sub ${EnvironmentName} Alert Notifications
+      Subscription:
+        - Protocol: email
+          Endpoint: !Ref AlertEmail
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-Alert-Topic
+
+  # -----------------------------------------------------------
+  # ALARM 1: High CPU on Auto Scaling Group
+  # Triggers when average CPU > threshold for 2 consecutive 5-min periods
+  # -----------------------------------------------------------
+  HighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${EnvironmentName}-High-CPU
+      AlarmDescription: >
+        CPU utilization on the ASG exceeded the high alarm threshold.
+        This may indicate sustained high load. ASG target tracking policy
+        should be scaling, but investigate if alarm persists.
+      Namespace: AWS/EC2
+      MetricName: CPUUtilization
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !ImportValue
+            Fn::Sub: ${EnvironmentName}-ASG-Name
+      Statistic: Average
+      Period: 300          # 5-minute period
+      EvaluationPeriods: 2
+      Threshold: !Ref CPUAlarmThreshold
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+      OKActions:
+        - !Ref AlertTopic
+
+  # -----------------------------------------------------------
+  # ALARM 2: Unhealthy ALB Target Hosts
+  # Triggers immediately when any EC2 instance fails health checks
+  # -----------------------------------------------------------
+  UnhealthyHostsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${EnvironmentName}-Unhealthy-Hosts
+      AlarmDescription: >
+        One or more EC2 instances in the target group are failing ALB health
+        checks. Investigate application errors or instance health immediately.
+      Namespace: AWS/ApplicationELB
+      MetricName: UnHealthyHostCount
+      Dimensions:
+        - Name: TargetGroup
+          Value: !ImportValue
+            Fn::Sub: ${EnvironmentName}-TG-ARN
+        - Name: LoadBalancer
+          Value: !ImportValue
+            Fn::Sub: ${EnvironmentName}-ALB-FullName
+      Statistic: Maximum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: !Ref UnhealthyHostThreshold
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+      OKActions:
+        - !Ref AlertTopic
+
+  # -----------------------------------------------------------
+  # ALARM 3: ALB 5xx Error Rate
+  # HTTP 5xx from the target group indicates backend errors
+  # -----------------------------------------------------------
+  HTTP5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${EnvironmentName}-HTTP-5xx-Errors
+      AlarmDescription: >
+        The rate of HTTP 5xx errors from the application backend is elevated.
+        This indicates application errors or misconfigurations.
+      Namespace: AWS/ApplicationELB
+      MetricName: HTTPCode_Target_5XX_Count
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !ImportValue
+            Fn::Sub: ${EnvironmentName}-ALB-FullName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 10
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+
+  # -----------------------------------------------------------
+  # ALARM 4: ALB Target Response Time (Latency)
+  # -----------------------------------------------------------
+  HighLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${EnvironmentName}-High-Latency
+      AlarmDescription: >
+        ALB target response time exceeded 2 seconds. This may indicate
+        database query slowness or CPU saturation on EC2 instances.
+      Namespace: AWS/ApplicationELB
+      MetricName: TargetResponseTime
+      Dimensions:
+        - Name: LoadBalancer
+          Value: !ImportValue
+            Fn::Sub: ${EnvironmentName}-ALB-FullName
+      Statistic: p95   # 95th percentile latency
+      Period: 300
+      EvaluationPeriods: 2
+      Threshold: 2     # 2 seconds
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+
+  # -----------------------------------------------------------
+  # ALARM 5: RDS High Database Connections
+  # -----------------------------------------------------------
+  RDSHighConnectionsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${EnvironmentName}-RDS-High-Connections
+      AlarmDescription: >
+        RDS database connection count is elevated. Consider connection pooling
+        or scaling the database instance class if sustained.
+      Namespace: AWS/RDS
+      MetricName: DatabaseConnections
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Sub ${EnvironmentName}-mysql-db
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 150   # Alert at 150 connections (max is 200 for t3.micro)
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+
+  # -----------------------------------------------------------
+  # ALARM 6: RDS Free Storage Low
+  # -----------------------------------------------------------
+  RDSLowStorageAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${EnvironmentName}-RDS-Low-Storage
+      AlarmDescription: >
+        RDS free storage space is below 5 GB. Storage auto-scaling should
+        activate, but monitor to ensure it scales before storage is exhausted.
+      Namespace: AWS/RDS
+      MetricName: FreeStorageSpace
+      Dimensions:
+        - Name: DBInstanceIdentifier
+          Value: !Sub ${EnvironmentName}-mysql-db
+      Statistic: Minimum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5368709120   # 5 GB in bytes
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+
+  # -----------------------------------------------------------
+  # ALARM 7: ASG Scaling Activity — tracks scale-out events
+  # -----------------------------------------------------------
+  ScaleOutAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub ${EnvironmentName}-Scale-Out-Event
+      AlarmDescription: >
+        The Auto Scaling Group has scaled out (added instances). This is
+        informational — check if load is sustained or a traffic spike.
+      Namespace: AWS/AutoScaling
+      MetricName: GroupInServiceInstances
+      Dimensions:
+        - Name: AutoScalingGroupName
+          Value: !ImportValue
+            Fn::Sub: ${EnvironmentName}-ASG-Name
+      Statistic: Maximum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3    # Alert when more than 3 instances running
+      ComparisonOperator: GreaterThanThreshold
+      TreatMissingData: notBreaching
+      AlarmActions:
+        - !Ref AlertTopic
+
+  # -----------------------------------------------------------
+  # CloudWatch Dashboard — executive overview
+  # -----------------------------------------------------------
+  MonitoringDashboard:
+    Type: AWS::CloudWatch::Dashboard
+    Properties:
+      DashboardName: !Sub ${EnvironmentName}-Overview
+      DashboardBody: !Sub |
+        {
+          "widgets": [
+            {
+              "type": "text",
+              "x": 0, "y": 0, "width": 24, "height": 1,
+              "properties": {
+                "markdown": "# ${EnvironmentName} — E-Commerce Application Dashboard\nRegion: ${AWS::Region} | Last updated: Auto-refreshed every minute"
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 1, "width": 8, "height": 6,
+              "properties": {
+                "title": "EC2 CPU Utilization (ASG Average)",
+                "metrics": [
+                  ["AWS/EC2", "CPUUtilization", "AutoScalingGroupName", "${EnvironmentName}-ASG",
+                   {"stat": "Average", "period": 300, "color": "#FF6B6B"}]
+                ],
+                "yAxis": {"left": {"min": 0, "max": 100}},
+                "annotations": {"horizontal": [{"value": 60, "label": "ASG Scale Threshold", "color": "#FFA500"}]},
+                "view": "timeSeries", "stacked": false
+              }
+            },
+            {
+              "type": "metric",
+              "x": 8, "y": 1, "width": 8, "height": 6,
+              "properties": {
+                "title": "ALB — Requests Per Minute",
+                "metrics": [
+                  ["AWS/ApplicationELB", "RequestCount", "LoadBalancer", "${EnvironmentName}-ALB",
+                   {"stat": "Sum", "period": 60, "color": "#4ECDC4"}]
+                ],
+                "view": "timeSeries", "stacked": false
+              }
+            },
+            {
+              "type": "metric",
+              "x": 16, "y": 1, "width": 8, "height": 6,
+              "properties": {
+                "title": "ALB — Target Response Time (p95)",
+                "metrics": [
+                  ["AWS/ApplicationELB", "TargetResponseTime", "LoadBalancer", "${EnvironmentName}-ALB",
+                   {"stat": "p95", "period": 300, "color": "#95E1D3"}]
+                ],
+                "annotations": {"horizontal": [{"value": 2, "label": "2s Threshold", "color": "#FF6B6B"}]},
+                "view": "timeSeries", "stacked": false
+              }
+            },
+            {
+              "type": "metric",
+              "x": 0, "y": 7, "width": 8, "height": 6,
+              "properties": {
+                "title": "ALB — Healthy vs Unhealthy Hosts",
+                "metrics": [
+                  ["AWS/ApplicationELB", "HealthyHostCount", "TargetGroup", "${EnvironmentName}-TG",
+                   "LoadBalancer", "${EnvironmentName}-ALB", {"stat": "Average", "color": "#4CAF50"}],
+                  ["AWS/ApplicationELB", "UnHealthyHostCount", "TargetGroup", "${EnvironmentName}-TG",
+                   "LoadBalancer", "${EnvironmentName}-ALB", {"stat": "Maximum", "color": "#F44336"}]
+                ],
+                "view": "timeSeries", "stacked": false
+              }
+            },
+            {
+              "type": "metric",
+              "x": 8, "y": 7, "width": 8, "height": 6,
+              "properties": {
+                "title": "RDS — Database Connections",
+                "metrics": [
+                  ["AWS/RDS", "DatabaseConnections", "DBInstanceIdentifier", "${EnvironmentName}-mysql-db",
+                   {"stat": "Maximum", "period": 300, "color": "#C7131F"}]
+                ],
+                "annotations": {"horizontal": [{"value": 150, "label": "High Connections Alert"}]},
+                "view": "timeSeries", "stacked": false
+              }
+            },
+            {
+              "type": "metric",
+              "x": 16, "y": 7, "width": 8, "height": 6,
+              "properties": {
+                "title": "ASG — Group In Service Instances",
+                "metrics": [
+                  ["AWS/AutoScaling", "GroupInServiceInstances", "AutoScalingGroupName", "${EnvironmentName}-ASG",
+                   {"stat": "Average", "period": 300, "color": "#EC7211"}]
+                ],
+                "yAxis": {"left": {"min": 0}},
+                "view": "timeSeries", "stacked": false
+              }
+            },
+            {
+              "type": "alarm",
+              "x": 0, "y": 13, "width": 24, "height": 4,
+              "properties": {
+                "title": "All Alarms Status",
+                "alarms": [
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${EnvironmentName}-High-CPU",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${EnvironmentName}-Unhealthy-Hosts",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${EnvironmentName}-HTTP-5xx-Errors",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${EnvironmentName}-High-Latency",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${EnvironmentName}-RDS-High-Connections",
+                  "arn:aws:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${EnvironmentName}-RDS-Low-Storage"
+                ]
+              }
+            }
+          ]
+        }
+
+# =============================================================
+# OUTPUTS
+# =============================================================
+Outputs:
+
+  AlertTopicArn:
+    Description: ARN of the SNS alert topic
+    Value: !Ref AlertTopic
+    Export:
+      Name: !Sub ${EnvironmentName}-Alert-Topic-ARN
+
+  DashboardURL:
+    Description: CloudWatch dashboard URL
+    Value: !Sub https://${AWS::Region}.console.aws.amazon.com/cloudwatch/home#dashboards:name=${EnvironmentName}-Overview

@@ -1,0 +1,216 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Security Stack — Security Groups for ALB, EC2 Auto Scaling instances, and RDS.
+  Implements defense-in-depth with least-privilege rules: only the ALB SG can
+  reach EC2, only the EC2 SG can reach RDS. No direct inbound from the internet
+  to compute or database tiers.
+  Project: Scalable E-Commerce Web Application on AWS
+  Author: Aziz Benchikh
+
+# =============================================================
+# PARAMETERS
+# =============================================================
+Parameters:
+  EnvironmentName:
+    Type: String
+    Default: EcommerceApp
+
+# =============================================================
+# RESOURCES
+# =============================================================
+Resources:
+
+  # -----------------------------------------------------------
+  # ALB Security Group
+  # Allows HTTPS (443) from the internet only.
+  # HTTP (80) is allowed only to redirect to HTTPS.
+  # -----------------------------------------------------------
+  ALBSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${EnvironmentName}-ALB-SG
+      GroupDescription: >
+        Security Group for the Application Load Balancer.
+        Allows inbound HTTPS from the internet; EC2 instances
+        only accept traffic from this SG.
+      VpcId: !ImportValue
+        Fn::Sub: ${EnvironmentName}-VPC-ID
+      SecurityGroupIngress:
+        # HTTPS from internet
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: 0.0.0.0/0
+          Description: HTTPS from internet
+        # HTTP for redirect to HTTPS
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+          Description: HTTP for HTTPS redirect
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-ALB-SG
+        - Key: Project
+          Value: !Ref EnvironmentName
+
+  # -----------------------------------------------------------
+  # EC2 Application Security Group
+  # Only allows inbound from the ALB Security Group.
+  # No direct internet access. Outbound for package installs
+  # goes through NAT Gateway.
+  # -----------------------------------------------------------
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${EnvironmentName}-EC2-SG
+      GroupDescription: >
+        Security Group for EC2 instances in private subnets.
+        Accepts traffic only from the ALB SG on port 80.
+      VpcId: !ImportValue
+        Fn::Sub: ${EnvironmentName}-VPC-ID
+      SecurityGroupIngress:
+        # HTTP from ALB only
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref ALBSecurityGroup
+          Description: HTTP from ALB Security Group only
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound (for NAT GW access)
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-EC2-SG
+        - Key: Project
+          Value: !Ref EnvironmentName
+
+  # -----------------------------------------------------------
+  # RDS Security Group
+  # Only allows MySQL (3306) from the EC2 Security Group.
+  # Completely isolated from internet.
+  # -----------------------------------------------------------
+  RDSSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${EnvironmentName}-RDS-SG
+      GroupDescription: >
+        Security Group for RDS MySQL instance.
+        Accepts MySQL connections only from the EC2 SG.
+      VpcId: !ImportValue
+        Fn::Sub: ${EnvironmentName}-VPC-ID
+      SecurityGroupIngress:
+        # MySQL from EC2 SG only
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref EC2SecurityGroup
+          Description: MySQL from EC2 Security Group only
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+          Description: Allow all outbound
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-RDS-SG
+        - Key: Project
+          Value: !Ref EnvironmentName
+
+  # -----------------------------------------------------------
+  # VPC Endpoint for SSM (Systems Manager Session Manager)
+  # Allows EC2 instances in private subnets to be accessed
+  # securely without a bastion host or open SSH port.
+  # -----------------------------------------------------------
+  SSMEndpointSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupName: !Sub ${EnvironmentName}-SSM-Endpoint-SG
+      GroupDescription: Security Group for SSM VPC Endpoints
+      VpcId: !ImportValue
+        Fn::Sub: ${EnvironmentName}-VPC-ID
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          SourceSecurityGroupId: !Ref EC2SecurityGroup
+          Description: HTTPS from EC2 instances for SSM
+      Tags:
+        - Key: Name
+          Value: !Sub ${EnvironmentName}-SSM-Endpoint-SG
+
+  # SSM VPC Interface Endpoints (enables Session Manager without NAT)
+  SSMEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ssm
+      VpcId: !ImportValue
+        Fn::Sub: ${EnvironmentName}-VPC-ID
+      SubnetIds:
+        - !ImportValue
+          Fn::Sub: ${EnvironmentName}-Private-Subnet-AZ1
+        - !ImportValue
+          Fn::Sub: ${EnvironmentName}-Private-Subnet-AZ2
+      SecurityGroupIds:
+        - !Ref SSMEndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+  SSMMessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ssmmessages
+      VpcId: !ImportValue
+        Fn::Sub: ${EnvironmentName}-VPC-ID
+      SubnetIds:
+        - !ImportValue
+          Fn::Sub: ${EnvironmentName}-Private-Subnet-AZ1
+        - !ImportValue
+          Fn::Sub: ${EnvironmentName}-Private-Subnet-AZ2
+      SecurityGroupIds:
+        - !Ref SSMEndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+  EC2MessagesEndpoint:
+    Type: AWS::EC2::VPCEndpoint
+    Properties:
+      VpcEndpointType: Interface
+      ServiceName: !Sub com.amazonaws.${AWS::Region}.ec2messages
+      VpcId: !ImportValue
+        Fn::Sub: ${EnvironmentName}-VPC-ID
+      SubnetIds:
+        - !ImportValue
+          Fn::Sub: ${EnvironmentName}-Private-Subnet-AZ1
+        - !ImportValue
+          Fn::Sub: ${EnvironmentName}-Private-Subnet-AZ2
+      SecurityGroupIds:
+        - !Ref SSMEndpointSecurityGroup
+      PrivateDnsEnabled: true
+
+# =============================================================
+# OUTPUTS
+# =============================================================
+Outputs:
+
+  ALBSecurityGroup:
+    Description: Security Group ID for the ALB
+    Value: !Ref ALBSecurityGroup
+    Export:
+      Name: !Sub ${EnvironmentName}-ALB-SG
+
+  EC2SecurityGroup:
+    Description: Security Group ID for EC2 instances
+    Value: !Ref EC2SecurityGroup
+    Export:
+      Name: !Sub ${EnvironmentName}-EC2-SG
+
+  RDSSecurityGroup:
+    Description: Security Group ID for RDS
+    Value: !Ref RDSSecurityGroup
+    Export:
+      Name: !Sub ${EnvironmentName}-RDS-SG
